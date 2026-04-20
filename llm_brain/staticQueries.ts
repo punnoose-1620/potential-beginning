@@ -14,3 +14,21 @@ export function isolateParameterQuery(returnSchemaDescription: string): string {
     "User message:",
   ].join("\n");
 }
+
+/**
+ * Product shortlist for the recommender LLM: JSON array of { product_id, variation_id, title, description }.
+ */
+export function productRecommendationUserPrompt(candidatesJson: string): string {
+  return [
+    "You are selecting the best-matching products for a client’s event or venue request.",
+    "Return ONLY valid JSON matching the generation schema (selected_product_ids, optional notes).",
+    "You MUST only include product_id values that appear in the candidates list below.",
+    "Prefer a small set of highly relevant products (order matters: most relevant first).",
+    "If none of the candidates are a reasonable fit, return selected_product_ids as an empty array.",
+    "",
+    "Candidates (JSON array):",
+    candidatesJson,
+    "",
+    "Client requirements:",
+  ].join("\n");
+}

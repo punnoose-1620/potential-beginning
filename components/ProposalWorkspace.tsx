@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type CompanyRow = {
   id: number;
@@ -81,23 +81,43 @@ function flattenForGrid(
   return out;
 }
 
+type GenerateResponse = {
+  created?: boolean;
+  reason?: string;
+  recommended_products?: ProductRow[];
+  proposal?: unknown;
+  verificationRequired?: boolean;
+  diagnostics?: unknown;
+  error?: string;
+};
+
+function reasonMessage(reason: string | undefined): string {
+  switch (reason) {
+    case "no_candidates":
+      return "No products matched your request keywords against the catalog. Try adding more specific services, catering, or venue terms.";
+    case "llm_failed":
+      return "Product selection could not run (Gemini unavailable or failed). Set GEMINI_API_KEY and try again.";
+    case "llm_returned_empty":
+      return "No products were selected as a good fit for this request. Refine your requirements or expand the catalog.";
+    case "invalid_llm_output":
+      return "The model returned product ids that did not match the catalog. Try again or check API responses.";
+    default:
+      return "Proposal was not created.";
+  }
+}
+
 export function ProposalWorkspace() {
   const [companiesList, setCompaniesList] = useState<CompanyRow[]>([]);
   const [companiesReady, setCompaniesReady] = useState(false);
   const [companiesError, setCompaniesError] = useState<string | null>(null);
 
-  const [productsList, setProductsList] = useState<ProductRow[]>([]);
-  const [productsReady, setProductsReady] = useState(false);
-  const [productsError, setProductsError] = useState<string | null>(null);
-
   const [companyId, setCompanyId] = useState<number | "">("");
-  const [selectedProductIds, setSelectedProductIds] = useState<Set<number>>(new Set());
   const [query, setQuery] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
 
   const [generateLoading, setGenerateLoading] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
-  const [generatePayload, setGeneratePayload] = useState<unknown>(null);
+  const [generatePayload, setGeneratePayload] = useState<GenerateResponse | null>(null);
 
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
@@ -128,55 +148,18 @@ export function ProposalWorkspace() {
     };
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch("/api/get-products");
-        const json = (await res.json()) as { data?: ProductRow[] };
-        if (!res.ok) throw new Error("Failed to load products");
-        if (!cancelled) {
-          setProductsList(Array.isArray(json.data) ? json.data : []);
-          setProductsError(null);
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setProductsError(e instanceof Error ? e.message : "Products fetch failed");
-          setProductsList([]);
-        }
-      } finally {
-        if (!cancelled) setProductsReady(true);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   const queryTrimmed = query.trim();
   const canGenerate =
-    companyId !== "" &&
-    selectedProductIds.size > 0 &&
-    queryTrimmed.length >= 50 &&
-    !generateLoading;
-
-  const toggleProduct = useCallback((id: number) => {
-    setSelectedProductIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }, []);
+    companyId !== "" && queryTrimmed.length >= 50 && !generateLoading;
 
   const proposalForDisplay = useMemo(() => {
     if (!generatePayload || typeof generatePayload !== "object") return null;
-    const p = generatePayload as Record<string, unknown>;
+    const p = generatePayload as GenerateResponse;
     const proposal = p.proposal;
-    if (proposal && typeof proposal === "object" && "data" in proposal) {
+    if (proposal && typeof proposal === "object" && "data" in (proposal as object)) {
       return (proposal as { data: unknown }).data;
     }
-    return proposal;
+    return proposal ?? null;
   }, [generatePayload]);
 
   const resultRows = useMemo(() => {
@@ -196,16 +179,21 @@ export function ProposalWorkspace() {
         body: JSON.stringify({
           query: queryTrimmed,
           company: companyId,
-          product_ids: Array.from(selectedProductIds),
         }),
       });
-      const json = await res.json();
+      const json = (await res.json()) as GenerateResponse;
+      setGeneratePayload(json);
+
       if (!res.ok) {
         const msg =
           typeof json.error === "string" ? json.error : `Request failed (${res.status})`;
-        throw new Error(msg);
+        setGenerateError(msg);
+        return;
       }
-      setGeneratePayload(json);
+
+      if (json.created === false) {
+        setGenerateError(null);
+      }
     } catch (e) {
       setGenerateError(e instanceof Error ? e.message : "Generate failed");
     } finally {
@@ -237,10 +225,10 @@ export function ProposalWorkspace() {
     }
   }
 
-  const verificationRequired =
-    generatePayload &&
-    typeof generatePayload === "object" &&
-    (generatePayload as Record<string, unknown>).verificationRequired === true;
+  const verificationRequired = Boolean(generatePayload?.verificationRequired);
+  const created = generatePayload?.created;
+  const skipReason = generatePayload?.reason;
+  const recommended = generatePayload?.recommended_products ?? [];
 
   return (
     <div className="space-y-10">
@@ -258,7 +246,8 @@ export function ProposalWorkspace() {
           <code className="rounded bg-zinc-100 px-1.5 py-0.5 text-xs text-zinc-800">
             .env.local
           </code>{" "}
-          for live APIs; otherwise dummy data is used.
+          for live APIs; otherwise dummy data is used. Products are chosen automatically from your
+          requirements.
         </p>
         <Link
           href="/legacy"
@@ -271,8 +260,7 @@ export function ProposalWorkspace() {
       <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
         <h2 className="text-lg font-semibold text-zinc-900">Proposal search</h2>
         <p className="mt-1 text-sm text-zinc-600">
-          Search previous proposals. Results appear below and replace the proposal result view context
-          when you run a new search.
+          Search previous proposals. Results appear below.
         </p>
         <form onSubmit={onSearchSubmit} className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-end">
           <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-zinc-800">
@@ -334,48 +322,11 @@ export function ProposalWorkspace() {
       </section>
 
       <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
-        <h2 className="text-lg font-semibold text-zinc-900">
-          Which of these products would you like as a part of your event?
-        </h2>
-        <p className="mt-1 text-sm text-zinc-600">
-          This preferred list will be considered when creating a proposal. Select at least one product.
-        </p>
-        {!productsReady ? (
-          <p className="mt-3 text-sm text-zinc-500">Loading products…</p>
-        ) : productsError ? (
-          <p className="mt-3 text-sm text-red-600">{productsError}</p>
-        ) : (
-          <ul className="mt-4 grid gap-3 sm:grid-cols-2">
-            {productsList.map((p) => {
-              const checked = selectedProductIds.has(p.product_id);
-              return (
-                <li key={`${p.product_id}-${p.variation_id}`}>
-                  <label className="flex cursor-pointer gap-3 rounded-xl border border-zinc-200 bg-zinc-50/50 p-4 transition hover:border-sky-300 hover:bg-white has-[:checked]:border-sky-400 has-[:checked]:bg-sky-50/40">
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={() => toggleProduct(p.product_id)}
-                      className="mt-1 size-4 shrink-0 rounded border-zinc-400 text-sky-600 focus:ring-sky-500"
-                    />
-                    <span className="min-w-0">
-                      <span className="block font-semibold text-zinc-900">
-                        {localeText(p.title)}
-                      </span>
-                      <span className="mt-1 block text-sm leading-snug text-zinc-600">
-                        {localeText(p.description)}
-                      </span>
-                    </span>
-                  </label>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </section>
-
-      <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
         <h2 className="text-lg font-semibold text-zinc-900">What are your requirements?</h2>
-        <p className="mt-1 text-sm text-zinc-600">At least 50 characters after trimming.</p>
+        <p className="mt-1 text-sm text-zinc-600">
+          Describe services, dates, guest count, catering, AV, budget, and any special needs. Products
+          are matched automatically from this text (at least 50 characters after trim).
+        </p>
         <textarea
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -401,21 +352,54 @@ export function ProposalWorkspace() {
             {generateError}
           </p>
         ) : null}
+        {generatePayload && created === false && !generateError ? (
+          <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+            {reasonMessage(skipReason)}
+          </p>
+        ) : null}
         {verificationRequired ? (
           <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-            Extraction completed with verification required — please review the generated fields.
+            Booking extraction completed with verification required — please review the generated
+            fields.
           </p>
         ) : null}
       </section>
 
+      {recommended.length > 0 ? (
+        <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
+          <h2 className="text-lg font-semibold text-zinc-900">Recommended products</h2>
+          <p className="mt-1 text-sm text-zinc-600">
+            Chosen for this request (deterministic keyword shortlist, then Gemini selection).
+          </p>
+          <ul className="mt-4 grid gap-3 sm:grid-cols-2">
+            {recommended.map((p) => (
+              <li
+                key={`${p.product_id}-${p.variation_id}`}
+                className="rounded-xl border border-zinc-200 bg-zinc-50/50 p-4"
+              >
+                <div className="text-xs font-medium text-zinc-500">
+                  Product #{p.product_id}
+                  {p.variation_id ? ` · variation ${p.variation_id}` : ""}
+                </div>
+                <div className="mt-1 font-semibold text-zinc-900">{localeText(p.title)}</div>
+                <div className="mt-1 text-sm text-zinc-600">{localeText(p.description)}</div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
       <section className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
         <h2 className="text-lg font-semibold text-zinc-900">Generated proposal</h2>
         <p className="mt-1 text-sm text-zinc-600">
-          Shown after a successful generate call. Key fields in a simple grid; raw JSON available
-          below.
+          Shown when a proposal is created. Key fields in a grid; raw JSON below.
         </p>
         {!generatePayload ? (
-          <p className="mt-6 text-sm text-zinc-500">No proposal loaded yet.</p>
+          <p className="mt-6 text-sm text-zinc-500">No response yet.</p>
+        ) : created === false ? (
+          <p className="mt-6 text-sm text-zinc-500">
+            No proposal was stored. Adjust your requirements or check diagnostics in the raw JSON.
+          </p>
         ) : (
           <div className="mt-6 space-y-4">
             {resultRows.length > 0 ? (

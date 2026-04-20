@@ -111,6 +111,60 @@ These contain the following functions :
 
 ## 5. Server Connectors : `server_connect/proposalesConnector.ts`
 
+> Note: Structure of proposal block : {
+  updated_at?: number
+  source_content_updated_at?: number
+  comment?: string
+  content_id?: number
+  currency?: string
+  description?: string
+  fixed_discount?: number
+  image_uuids?: string[]
+  inventory_connected?: boolean
+  language: string
+  multi_product_data?: MultiProductRow[]
+  multi_product_enabled?: boolean
+  optional_picked?: boolean
+  optional?: boolean
+  package_split?: PackageSplit
+  percent_discount?: number
+  quantity_editable?: boolean
+  quantity_max?: number
+  quantity_min?: number
+  quantity_variable_data?: string
+  quantity_variable?: boolean
+  quantity_visible?: boolean
+  quantity?: number
+  recurring?: boolean
+  relative?: boolean
+  sources?: {
+    integration: {
+      integrationId: number
+      uniqueId: string
+      metadata: Record<string, unknown>
+    }
+  }
+  title?: string
+  type: 'product-block' | 'video-block'
+  unit_value_with_discount_with_tax?: number
+  unit_value_with_discount_without_tax?: number
+  unit_value_without_discount_with_tax?: number
+  unit_value_without_discount_without_tax?: number
+  unit?: Unit
+  uuid: string
+  video_url?: string
+}
+
+> Note: Structure of proposal attachment : {
+    id: number
+    mime_type: string
+    name: string
+    // For text/html: url is present, uuid is absent
+    // For other types: uuid is present, url is absent
+    url?: string
+    uuid?: string
+}
+
 - **DUMMY_COMPANIES** : 
     - static list of dummy companies
     - array of JSON dict
@@ -491,12 +545,16 @@ These rules remove ambiguity when implementing TypeScript / Next.js. They **over
 ## Identifiers
 
 - **`company` in `POST /api/generate-proposal`:** numeric **company id** from `listCompanies` / UI `companiesList` — same value as Proposales **`company_id`**.
-- **`product_ids`:** array of numeric **`product_id`** values as returned by **`GET /v3/content`** (`data[].product_id`). The multi-select stores these. If a downstream call requires **`variation_id`**, resolve it from the cached product row for that **`product_id`**.
+- **Product selection is server-side:** the client does **not** send **`product_ids`**. The server calls **`listProducts()`**, runs deterministic keyword extraction + scoring, then **`runProductRecommender`** (Gemini) to choose **`product_id`** values. Resolved rows use **`variation_id`** from the matching catalog row.
 - **`proposal_id` in `GET /api/get-single-proposal/{proposal_id}` and `GET /v3/proposals/{proposal_id}`:** the proposal **`uuid`** string unless OpenAPI explicitly documents otherwise.
 
 ## Product lookup for `generate-proposal`
 
-- Use the **same product list** the page loaded (`productsList`) or re-fetch via **`listProducts()`**. Filter `data` where **`product_id`** is in **`product_ids`**. Pass **selected rows** (or a trimmed projection: `product_id`, `variation_id`, `title`, `description`) into the mapper and into **`createProposal` → `data`**.
+- Re-fetch via **`listProducts()`** on each generate request (or use an in-memory cache if added later).
+- **Deterministic step:** tokenize/normalize **`query`**, drop stopwords, score products whose **title/description** text matches keywords (title hits weighted higher than description). Cap candidates (e.g. **`MAX_PRODUCT_CANDIDATES`**).
+- **LLM step:** from candidates only, output **`selected_product_ids`**; invalid ids are dropped. **No** fallback that pretends unmatched products were “recommended.”
+- If there are **no** keyword candidates, the recommender fails, or the model returns **no** valid ids, the API returns **`created: false`** and **`recommended_products: []`** — **do not** call **`createProposal`** in those cases.
+- If ids are valid, resolve full rows and pass them into **`createProposal` → `data`** (and mapper).
 
 ## `createProposal` — suggested `data` payload
 
@@ -530,12 +588,13 @@ When mapping from **`bookingDetails`** leaves gaps:
 
 ## End-to-end `POST /api/generate-proposal` (server)
 
-1. Validate body: **`company`** present, **`product_ids`** length ≥ 1, **`query`** length ≥ 50 after **trim**.
-2. Resolve product rows for **`product_ids`** from cached **`listProducts`** (re-fetch if cache empty).
-3. Run **`runIsolator(query)`** → parsed **`bookingDetails`**; run **§4 verification order**. Respect **`verificationRequired`** on the wrapper if returned.
-4. **Map** `bookingDetails` + `query` + `company` + selected products → **`createProposal`** body (`company_id` = `company`, default **`language`:** `en` if unset, fill `title_md` / `description_md` / `blocks` / emails from extracted fields where possible).
-5. Call **`createProposal`**.
-6. **Response to client:** read **`uuid`** from the create response, then call **`getSingleProposal(uuid)`** and return a **stable JSON shape**, e.g. `{ "create": <createProposal response>, "proposal": <getSingleProposal data> }`, so the UI can render **full fields** (create alone may only return `uuid` + `url`).
+1. Validate body: **`company`** present, **`query`** length ≥ 50 after **trim**. Do **not** require client **`product_ids`**.
+2. **`listProducts()`** → deterministic keywords from **`query`** → score/filter → candidate list.
+3. **`runProductRecommender(query, candidates)`** → **`selected_product_ids`** (subset of candidates). If empty / failure → return **`created: false`**, **`reason`**, **`recommended_products: []`**, **`diagnostics`** — **skip** **`createProposal`**.
+4. Run **`runIsolator(query)`** → **`bookingDetails`**; respect **`verificationRequired`**. If isolator fails entirely → **502** (no proposal created); response may still include **`recommended_products`** for debugging.
+5. **Map** `bookingDetails` + `query` + `company` + **LLM-resolved** product rows → **`createProposal`** body (`company_id` = `company`, default **`language`:** `en`, etc.).
+6. Call **`createProposal`**, then **`getSingleProposal(uuid)`**.
+7. **Response:** stable shape, e.g. `{ "created": true, "recommended_products": [...], "create": ..., "proposal": ..., "verificationRequired": ..., "diagnostics": ... }`. When **`created`** is false, **`create`** / **`proposal`** are omitted.
 
 ## URL encoding
 
@@ -555,16 +614,15 @@ When mapping from **`bookingDetails`** leaves gaps:
     - Type : POST
     - body : {
         "query": user_entered_query,
-        "company": user_selected_company_id,
-        "product_ids": list_of_user_selected_product_ids
+        "company": user_selected_company_id
     }
     - Algorithm : 
-        > Validate `company`, `product_ids`, and `query` (length ≥ 50 after trim).
-        > Resolve product rows for `product_ids` from `listProducts` (see **Implementation contracts**).
-        > Call **`runIsolator(query)`** → **`bookingDetails`**; verify per §4.
-        > Map **`bookingDetails` + query + company + products** → **`createProposal`** body (see **Implementation contracts**).
-        > Call **`createProposal`**, then **`getSingleProposal(uuid)`** using the returned proposal uuid.
-        > Return JSON with **full proposal** for the UI (see **Implementation contracts** — response shape).
+        > Validate `company` and `query` (length ≥ 50 after trim).
+        > **`listProducts()`** → deterministic keyword filter → **`runProductRecommender`** → resolved product rows (see **Implementation contracts**). If none, return **`created: false`** and do not create a proposal.
+        > Call **`runIsolator(query)`** → **`bookingDetails`**; verify per §4 (or return 502 if isolator unavailable).
+        > Map **`bookingDetails` + query + company + recommended products** → **`createProposal`** body.
+        > Call **`createProposal`**, then **`getSingleProposal(uuid)`** when created.
+        > Return JSON including **`recommended_products`**, **`created`**, **`diagnostics`**, and proposal fields when applicable.
 
 ## 2. Get Companies
     - Path : `api/get-companies`
@@ -603,29 +661,26 @@ Create a visually pleasing, light themed front end.
 ## On Page Render, The following actions take place :
 
 1. Fetch list of companies
-2. Set list to global state variable in page called 'companiesList'
-3. Render drop down menu above search bar for users to select their company. List for selection is 'companiesList'.
-4. Fetch list of products
-5. Set list of global state variable in page called 'productsList'
-6. Render multiple select grid between search bar and companies list. Each selection shows title and description from an entry in 'productsList'
+2. Set list to global state variable in page called `companiesList`
+3. Render a drop-down for users to select their company (`companiesList`)
+4. (Optional) Product catalog is **not** loaded for manual selection; products are chosen server-side from `listProducts()` during generate
 
 ## Sections in UI Layout :
 
-- Proposal Search bar : for users to search their previous proposals. OnSubmit, it invokes the Search Proposal endpoint for result. Replaces content in Proposal Result section
-- Company Drop Down Menu Selector : Initially blocked and empty content. Visible and populated after fetching companies list as mentioned on the page render logic. 
-- Product Multi-choice Select Grid : Initially blocked and empty content. Visible and populated after fetching products list as mentioned on the page render logic.
-- Request Entry : User enters a string prompt
-- "Fetch Proposal" Button : performs api call to `api/generate-proposal`
-- Result Display : Usually display is blocked. When API call succeeds, it shows all values from generated proposal in a visually pleasing format.
+- Proposal Search bar : for users to search their previous proposals. OnSubmit, it invokes the Search Proposal endpoint for result.
+- Company Drop Down Menu Selector : Visible and populated after fetching companies list.
+- Request Entry : User enters requirements (prompt). Server derives product matches from this text.
+- Recommended products (after generate) : show **`recommended_products`** from the API when present.
+- "Fetch Proposal" Button : performs api call to `api/generate-proposal` with **`query`** + **`company`** only.
+- Result Display : When **`created`** is true, show proposal fields; when false, show reason / empty state without implying a proposal was stored.
 
 ## Layouts for populating values :
 
 - Company Drop down :
     Company ID - Company Name/Title
 
-- Product Option in Select Grid :
-    |checkBox| Product title (bold)
-               Product description (not bold, smaller font than title)
+- Recommended products (from API response) :
+    Product ID, title (bold), description (smaller)
 
 - Result Display (sample structure for grid. Expand this structure) : 
     Key1 : Value1       Key2 : Value2
@@ -635,13 +690,11 @@ Create a visually pleasing, light themed front end.
 ## Submit conditions for Generating proposals :
 
 - Company must be selected
-- At least one product must be selected
 - User's request/prompt must have **at least 50 characters** after **trim**. Send `query` as a normal **JSON string** in **`POST /api/generate-proposal`** (no URL encoding). Use **`encodeURIComponent`** only when placing text in a **URL path or query** (e.g. proposal search), not for the generate body.
 
 ## Prompts/Titles for sections :
 
 - Company Selector : "Select your company"
-- Product Selector : "Which of these products would you like as a part of your event? This preferred list will be considered when creating a proposal. Select at least one product."
-- User Prompt : "What are your requirements?"
+- User Prompt : "What are your requirements?" (products are inferred automatically)
 
 > Note: "Proposals" and "Proposales" are two different terms. "Proposals" is a data structure. "Proposales" is a database that is accessed using API key.

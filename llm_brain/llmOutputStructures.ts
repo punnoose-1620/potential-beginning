@@ -297,3 +297,40 @@ export function emptyBookingDetails(): BookingDetailsData {
     currency: "",
   };
 }
+
+/** LLM output: which catalog products fit the request (ids must be validated against candidates). */
+export type ProductRecommendationData = {
+  selected_product_ids: number[];
+  notes?: string;
+};
+
+const productRecommendationRootSchema: ObjectSchema = {
+  type: SchemaType.OBJECT,
+  properties: {
+    selected_product_ids: {
+      type: SchemaType.ARRAY,
+      items: { type: SchemaType.INTEGER },
+    },
+    notes: { type: SchemaType.STRING },
+  },
+  required: ["selected_product_ids"],
+};
+
+export function productRecommendationGenerationConfig(): GenerationConfig {
+  return {
+    responseMimeType: "application/json",
+    responseSchema: productRecommendationRootSchema,
+  };
+}
+
+export function parseProductRecommendationFromText(text: string): ProductRecommendationData {
+  const j = parseJsonObject<Record<string, unknown>>(text);
+  const raw = j.selected_product_ids;
+  const selected_product_ids = Array.isArray(raw)
+    ? raw.filter((x): x is number => typeof x === "number" && Number.isFinite(x)).map(Math.floor)
+    : [];
+  return {
+    selected_product_ids,
+    notes: typeof j.notes === "string" ? j.notes : undefined,
+  };
+}

@@ -23,13 +23,34 @@ const SYSTEM_STATIC =
   "You are a precise information extractor for hotel and event RFPs. Follow the JSON schema from generation settings exactly.";
 
 function isRateLimitError(e: unknown): boolean {
-  const msg = e instanceof Error ? e.message : String(e);
-  return (
-    msg.includes("429") ||
-    msg.includes("RESOURCE_EXHAUSTED") ||
-    msg.includes("quota") ||
-    msg.includes("rate")
-  );
+  const seen = new Set<unknown>();
+  const queue: unknown[] = [e];
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    if (!cur || seen.has(cur)) continue;
+    seen.add(cur);
+    if (typeof cur === "string") {
+      const s = cur.toLowerCase();
+      if (s.includes("429") || s.includes("resource_exhausted") || s.includes("quota")) return true;
+      continue;
+    }
+    if (typeof cur === "number") {
+      if (cur === 429) return true;
+      continue;
+    }
+    if (typeof cur === "object") {
+      const rec = cur as Record<string, unknown>;
+      const status = rec.status;
+      const code = rec.code;
+      if (status === 429 || code === 429 || code === "429") return true;
+      if (typeof status === "string" && status.includes("429")) return true;
+      if (typeof code === "string" && code.toLowerCase().includes("resource_exhausted")) return true;
+      if ("message" in rec) queue.push(rec.message);
+      if ("cause" in rec) queue.push(rec.cause);
+      continue;
+    }
+  }
+  return false;
 }
 
 /**
